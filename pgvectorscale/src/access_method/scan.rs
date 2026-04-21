@@ -1,369 +1,83 @@
-use std::collections::BinaryHeap;
+//! Index scan callbacks for hanns_hnsw access method.
+//!
+//! Search: load hanns index from PG pages (with in-memory cache) → search → return results.
 
-use pgrx::{pg_sys::InvalidOffsetNumber, *};
+use pgrx::prelude::*;
+use pgrx::PgRelation;
+use std::os::raw::c_void;
 
-use crate::{
-    access_method::{
-        graph::neighbor_store::GraphNeighborStore, labels::LabeledVector, meta_page::MetaPage,
-        sbq::storage::SbqSpeedupStorage,
-    },
-    util::{buffer::PinnedBufferShare, ports::pgstat_count_index_scan, HeapPointer, IndexPointer},
-};
-
-use super::{
-    distance::DistanceFn,
-    graph::{Graph, ListSearchResult},
-    labels::LabelSetView,
-    plain::{
-        storage::{PlainStorage, PlainStorageLsnPrivateData},
-        PlainDistanceMeasure,
-    },
-    sbq::{
-        quantize::SbqQuantizer, storage::SbqSpeedupStorageLsnPrivateData, SbqMeans,
-        SbqSearchDistanceMeasure,
-    },
-    stats::QuantizerStats,
-    storage::{Storage, StorageType},
-};
-
-/* Be very careful not to transfer PgRelations in the state, as they can change between calls. That means we shouldn't be
-using lifetimes here. Everything should be owned */
-enum StorageState {
-    SbqSpeedup(
-        SbqQuantizer,
-        TSVResponseIterator<SbqSearchDistanceMeasure, SbqSpeedupStorageLsnPrivateData>,
-    ),
-    Plain(TSVResponseIterator<PlainDistanceMeasure, PlainStorageLsnPrivateData>),
-}
-
-/* no lifetime usage here. */
-struct TSVScanState {
-    storage: *mut StorageState,
-    distance_fn: Option<DistanceFn>,
-    meta_page: MetaPage,
-    last_buffer: Option<PinnedBufferShare>,
-}
-
-impl TSVScanState {
-    fn new(meta_page: MetaPage) -> Self {
-        Self {
-            storage: std::ptr::null_mut(),
-            distance_fn: None,
-            meta_page,
-            last_buffer: None,
-        }
-    }
-
-    fn initialize(
-        &mut self,
-        index: &PgRelation,
-        heap: &PgRelation,
-        query: LabeledVector,
-        search_list_size: usize,
-    ) {
-        let meta_page = MetaPage::fetch(index);
-        let storage = meta_page.get_storage_type();
-        let distance = meta_page.get_distance_function();
-
-        let store_type = match storage {
-            StorageType::Plain => {
-                let stats = QuantizerStats::default();
-                let bq = PlainStorage::load_for_search(index, heap, &meta_page);
-                let it =
-                    TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
-                StorageState::Plain(it)
-            }
-            StorageType::SbqCompression => {
-                let mut stats = QuantizerStats::default();
-                let quantizer = unsafe { SbqMeans::load(index, &meta_page, &mut stats) };
-                let bq = SbqSpeedupStorage::load_for_search(index, heap, &quantizer, &meta_page);
-                let it =
-                    TSVResponseIterator::new(&bq, index, query, search_list_size, meta_page, stats);
-                StorageState::SbqSpeedup(quantizer, it)
-            }
-        };
-
-        self.storage = PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(store_type);
-        self.distance_fn = Some(distance);
-    }
-}
-
-struct ResortData {
-    heap_pointer: HeapPointer,
-    index_pointer: IndexPointer,
-    distance: f32,
-}
-
-impl PartialEq for ResortData {
-    fn eq(&self, other: &Self) -> bool {
-        self.heap_pointer == other.heap_pointer
-    }
-}
-
-impl PartialOrd for ResortData {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Eq for ResortData {}
-
-impl Ord for ResortData {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        //notice the reverse here. Other is the one that is being compared to self
-        //this allows us to have a min heap
-        other.distance.total_cmp(&self.distance)
-    }
-}
-
-struct StreamingStats {
-    count: i32,
-    mean: f32,
-    m2: f32,
-    max_distance: f32,
-}
-
-impl StreamingStats {
-    fn new(_resort_size: usize) -> Self {
-        Self {
-            count: 0,
-            mean: 0.0,
-            m2: 0.0,
-            max_distance: 0.0,
-        }
-    }
-
-    fn update_base_stats(&mut self, distance: f32) {
-        if distance == 0.0 {
-            return;
-        }
-        self.count += 1;
-        let delta = distance - self.mean;
-        self.mean += delta / self.count as f32;
-        let delta2 = distance - self.mean;
-        self.m2 += delta * delta2;
-    }
-
-    #[allow(dead_code)]
-    fn variance(&self) -> f32 {
-        if self.count < 2 {
-            return 0.0;
-        }
-        self.m2 / (self.count - 1) as f32
-    }
-
-    fn update(&mut self, distance: f32, diff: f32) {
-        //base stats only on first resort_size elements
-        self.update_base_stats(diff);
-        self.max_distance = self.max_distance.max(distance);
-    }
-}
-
-struct TSVResponseIterator<QDM, PD> {
-    lsr: ListSearchResult<QDM, PD>,
-    search_list_size: usize,
-    meta_page: MetaPage,
-    quantizer_stats: QuantizerStats,
-    resort_size: usize,
-    resort_buffer: BinaryHeap<ResortData>,
-    streaming_stats: StreamingStats,
-    next_calls: i32,
-    next_calls_with_resort: i32,
-    full_distance_comparisons: i32,
-    has_label_filter: bool,
-}
-
-impl<QDM, PD> TSVResponseIterator<QDM, PD> {
-    fn new<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        storage: &S,
-        index: &PgRelation,
-        query: LabeledVector,
-        search_list_size: usize,
-        //FIXME?
-        _meta_page: MetaPage,
-        quantizer_stats: QuantizerStats,
-    ) -> Self {
-        let mut meta_page = MetaPage::fetch(index);
-        let mut graph = Graph::new(GraphNeighborStore::Disk, &mut meta_page);
-
-        let has_label_filter = query.labels().is_some_and(|labels| !labels.is_empty());
-        let lsr = graph.greedy_search_streaming_init(query, search_list_size, storage);
-        let resort_size = super::guc::TSV_RESORT_SIZE.get() as usize;
-
-        Self {
-            search_list_size,
-            lsr,
-            meta_page,
-            quantizer_stats,
-            resort_size,
-            resort_buffer: BinaryHeap::with_capacity(resort_size),
-            streaming_stats: StreamingStats::new(resort_size),
-            next_calls: 0,
-            next_calls_with_resort: 0,
-            full_distance_comparisons: 0,
-            has_label_filter,
-        }
-    }
-}
-
-impl<QDM, PD> TSVResponseIterator<QDM, PD> {
-    fn next<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        &mut self,
-        storage: &S,
-    ) -> Option<(HeapPointer, IndexPointer)> {
-        self.next_calls += 1;
-        let mut graph = Graph::new(GraphNeighborStore::Disk, &mut self.meta_page);
-
-        /* Iterate until we find a non-deleted tuple */
-        loop {
-            graph.greedy_search_iterate(
-                &mut self.lsr,
-                self.search_list_size,
-                !self.has_label_filter,
-                None,
-                storage,
-            );
-
-            let item = self.lsr.consume(storage);
-
-            match item {
-                Some((heap_pointer, index_pointer)) => {
-                    if heap_pointer.offset == InvalidOffsetNumber {
-                        /* deleted tuple */
-                        continue;
-                    }
-                    return Some((heap_pointer, index_pointer));
-                }
-                None => {
-                    return None;
-                }
-            }
-        }
-    }
-
-    fn next_with_resort<S: Storage<QueryDistanceMeasure = QDM, LSNPrivateData = PD>>(
-        &mut self,
-        scan: &PgBox<pg_sys::IndexScanDescData>,
-        _index: &PgRelation,
-        storage: &S,
-    ) -> Option<(HeapPointer, IndexPointer)> {
-        self.next_calls_with_resort += 1;
-        if self.resort_buffer.capacity() == 0 {
-            return self.next(storage);
-        }
-
-        while self.resort_buffer.len() < self.resort_size {
-            match self.next(storage) {
-                Some((heap_pointer, index_pointer)) => {
-                    self.full_distance_comparisons += 1;
-                    let distance = storage.get_full_distance_for_resort(
-                        scan,
-                        self.lsr.sdm.as_ref().unwrap(),
-                        index_pointer,
-                        heap_pointer,
-                        &self.meta_page,
-                        &mut self.lsr.stats,
-                    );
-
-                    match distance {
-                        None => {
-                            /* No entry found in heap */
-                            continue;
-                        }
-                        Some(distance) => {
-                            if self.resort_buffer.len() > 1 {
-                                self.streaming_stats
-                                    .update(distance, distance - self.streaming_stats.max_distance);
-                            }
-
-                            self.resort_buffer.push(ResortData {
-                                heap_pointer,
-                                index_pointer,
-                                distance,
-                            });
-                        }
-                    }
-                }
-                None => {
-                    break;
-                }
-            }
-        }
-
-        /*error!(
-            "Resort buffer size: {}, mean: {}, variance: {}, max_distance: {}: diff: {}",
-            self.resort_buffer.len(),
-            self.streaming_stats.mean(),
-            self.streaming_stats.variance().sqrt(),
-            self.streaming_stats.max_distance,
-            self.streaming_stats.max_distance - self.resort_buffer.peek().unwrap().distance
-        );*/
-
-        self.resort_buffer
-            .pop()
-            .map(|rd| (rd.heap_pointer, rd.index_pointer))
-    }
+/// Scan state stored as the index scan's opaque data.
+struct HnswScanState {
+    results: Vec<(i64, f32)>, // (ctid_as_i64, distance)
+    pos: usize,
 }
 
 #[pg_guard]
 pub extern "C-unwind" fn ambeginscan(
     index_relation: pg_sys::Relation,
-    nkeys: ::std::os::raw::c_int,
-    norderbys: ::std::os::raw::c_int,
+    _nkeys: ::std::os::raw::c_int,
+    _norderbys: ::std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
-    let mut scandesc: PgBox<pg_sys::IndexScanDescData> = unsafe {
-        PgBox::from_pg(pg_sys::RelationGetIndexScan(
-            index_relation,
-            nkeys,
-            norderbys,
-        ))
-    };
-    let indexrel = unsafe { PgRelation::from_pg(index_relation) };
-    let meta_page = MetaPage::fetch(&indexrel);
-
     unsafe {
-        pgstat_count_index_scan(index_relation, indexrel);
+        let scan = pg_sys::RelationGetIndexScan(index_relation, 0, 1);
+        (*scan).xs_recheck = false;
+        (*scan).opaque = std::ptr::null_mut();
+        scan
     }
-
-    let state: TSVScanState = TSVScanState::new(meta_page);
-    scandesc.opaque =
-        PgMemoryContexts::CurrentMemoryContext.leak_and_drop_on_delete(state) as void_mut_ptr;
-
-    scandesc.into_pg()
 }
 
 #[pg_guard]
 pub extern "C-unwind" fn amrescan(
     scan: pg_sys::IndexScanDesc,
-    keys: pg_sys::ScanKey,
-    nkeys: ::std::os::raw::c_int,
+    _keys: pg_sys::ScanKey,
+    _nkeys: ::std::os::raw::c_int,
     orderbys: pg_sys::ScanKey,
-    norderbys: ::std::os::raw::c_int,
+    _norderbys: ::std::os::raw::c_int,
 ) {
-    assert_eq!(norderbys, 1, "Expected a single order-by key");
-    assert!(nkeys == 0 || nkeys == 1, "Expected 0 or 1 keys");
+    unsafe {
+        if orderbys.is_null() {
+            return;
+        }
 
-    let mut scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
-    let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
-    let heaprel = unsafe { PgRelation::from_pg(scan.heapRelation) };
+        let index_rel = PgRelation::from_pg((*scan).indexRelation);
+        let orderby = &*orderbys;
+        let query_datum = orderby.sk_argument;
 
-    if nkeys > 0 {
-        scan.xs_recheck = true;
+        // Extract query vector from pgvector Datum
+        let varlena = pg_sys::pg_detoast_datum(query_datum.cast_mut_ptr());
+        let ptr = varlena as *const u8;
+        let dim = *(ptr.add(4) as *const u16);
+        let query_vec = std::slice::from_raw_parts(ptr.add(8) as *const f32, dim as usize);
+
+        // Load index from cache or pages
+        let hnsw = crate::access_method::index_cache::get_or_load(&index_rel)
+            .expect("failed to load hanns index");
+
+        // Search
+        let ef_search = crate::access_method::guc::ef_search();
+        let top_k = 100; // fetch enough for LIMIT to filter
+        let req = hanns::SearchRequest {
+            top_k,
+            nprobe: ef_search,
+            filter: None,
+            params: None,
+            radius: None,
+        };
+
+        let result = hnsw.search(query_vec, &req).expect("hanns search failed");
+
+        // Convert to scan state
+        let mut state = Box::new(HnswScanState {
+            results: Vec::with_capacity(result.ids.len()),
+            pos: 0,
+        });
+
+        for (i, &id) in result.ids.iter().enumerate() {
+            state.results.push((id, result.distances[i]));
+        }
+
+        (*scan).opaque = Box::into_raw(state) as *mut c_void;
     }
-
-    let orderby_keys = unsafe {
-        std::slice::from_raw_parts(orderbys as *const pg_sys::ScanKeyData, norderbys as _)
-    };
-    let keys =
-        unsafe { std::slice::from_raw_parts(keys as *const pg_sys::ScanKeyData, nkeys as _) };
-
-    let search_list_size = super::guc::TSV_QUERY_SEARCH_LIST_SIZE.get() as usize;
-
-    let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
-
-    let query = unsafe { LabeledVector::from_scan_key_data(keys, orderby_keys, &state.meta_page) };
-
-    state.initialize(&indexrel, &heaprel, query, search_list_size);
 }
 
 #[pg_guard]
@@ -371,106 +85,43 @@ pub extern "C-unwind" fn amgettuple(
     scan: pg_sys::IndexScanDesc,
     _direction: pg_sys::ScanDirection::Type,
 ) -> bool {
-    let scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
-    let state = unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
-
-    let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
-    let heaprel = unsafe { PgRelation::from_pg(scan.heapRelation) };
-
-    let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
-    match &mut storage {
-        StorageState::SbqSpeedup(quantizer, iter) => {
-            let bq = SbqSpeedupStorage::load_for_search(
-                &indexrel,
-                &heaprel,
-                quantizer,
-                &state.meta_page,
-            );
-            let next = iter.next_with_resort(&scan, &indexrel, &bq);
-            get_tuple(state, next, scan)
+    unsafe {
+        if (*scan).opaque.is_null() {
+            return false;
         }
-        StorageState::Plain(iter) => {
-            let storage = PlainStorage::load_for_search(&indexrel, &heaprel, &state.meta_page);
-            let next = if state.meta_page.get_num_dimensions()
-                == state.meta_page.get_num_dimensions_to_index()
-            {
-                /* no need to resort */
-                iter.next(&storage)
-            } else {
-                iter.next_with_resort(&scan, &indexrel, &storage)
-            };
-            get_tuple(state, next, scan)
-        }
-    }
-}
 
-fn get_tuple(
-    state: &mut TSVScanState,
-    next: Option<(HeapPointer, IndexPointer)>,
-    mut scan: PgBox<pg_sys::IndexScanDescData>,
-) -> bool {
-    scan.xs_recheckorderby = false;
-    match next {
-        Some((heap_pointer, index_pointer)) => {
-            let tid_to_set = &mut scan.xs_heaptid;
-            heap_pointer.to_item_pointer_data(tid_to_set);
+        let state = &mut *((*scan).opaque as *mut HnswScanState);
 
-            /*
-             * An index scan must maintain a pin on the index page holding the
-             * item last returned by amgettuple
-             *
-             * https://www.postgresql.org/docs/current/index-locking.html
-             */
-            let indexrel = unsafe { PgRelation::from_pg(scan.indexRelation) };
-            state.last_buffer = Some(PinnedBufferShare::read(
-                &indexrel,
-                index_pointer.block_number,
-            ));
-            true
+        if state.pos >= state.results.len() {
+            return false;
         }
-        None => {
-            state.last_buffer = None;
-            false
-        }
+
+        let (id, _dist) = state.results[state.pos];
+        state.pos += 1;
+
+        // Decode i64 back to ctid
+        let block = (id >> 16) as u32;
+        let offset = (id & 0xFFFF) as u16;
+
+        (*scan).xs_heaptid = pg_sys::ItemPointerData {
+            ip_blkid: pg_sys::BlockIdData {
+                bi_hi: (block >> 16) as u16,
+                bi_lo: (block & 0xFFFF) as u16,
+            },
+            ip_posid: offset,
+        };
+
+        true
     }
 }
 
 #[pg_guard]
 pub extern "C-unwind" fn amendscan(scan: pg_sys::IndexScanDesc) {
-    let min_level = unsafe {
-        let l = pg_sys::log_min_messages;
-        let c = pg_sys::client_min_messages;
-        std::cmp::min(l, c)
-    };
-    if min_level <= pg_sys::DEBUG1 as _ {
-        let scan: PgBox<pg_sys::IndexScanDescData> = unsafe { PgBox::from_pg(scan) };
-        let state =
-            unsafe { (scan.opaque as *mut TSVScanState).as_mut() }.expect("no scandesc state");
-
-        let mut storage = unsafe { state.storage.as_mut() }.expect("no storage in state");
-        match &mut storage {
-            StorageState::SbqSpeedup(_bq, iter) => end_scan::<SbqSpeedupStorage>(iter),
-            StorageState::Plain(iter) => end_scan::<PlainStorage>(iter),
+    unsafe {
+        if !(*scan).opaque.is_null() {
+            let _state = Box::from_raw((*scan).opaque as *mut HnswScanState);
+            // dropped here
         }
+        (*scan).opaque = std::ptr::null_mut();
     }
-}
-
-fn end_scan<S: Storage>(
-    iter: &mut TSVResponseIterator<S::QueryDistanceMeasure, S::LSNPrivateData>,
-) {
-    debug1!(
-        "Query stats - reads_index={} reads_heap={} d_total={} d_quantized={} d_full={} next={} resort={} visits={} candidate={}",
-        iter.lsr.stats.get_node_reads(),
-        iter.lsr.stats.get_node_heap_reads(),
-        iter.lsr.stats.get_total_distance_comparisons(),
-        iter.lsr.stats.get_quantized_distance_comparisons(),
-        iter.full_distance_comparisons,
-        iter.next_calls,
-        iter.next_calls_with_resort,
-        iter.lsr.stats.get_visited_nodes(),
-        iter.lsr.stats.get_candidate_nodes(),
-    );
-
-    debug_assert_eq!(iter.quantizer_stats.node_reads, 1);
-    debug_assert_eq!(iter.quantizer_stats.node_writes, 0);
 }
