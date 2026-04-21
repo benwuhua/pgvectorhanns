@@ -35,6 +35,7 @@ pub extern "C-unwind" fn amrescan(
     _norderbys: ::std::os::raw::c_int,
 ) {
     unsafe {
+        pgrx::warning!("scan: amrescan called, orderbys={:?}", orderbys);
         if orderbys.is_null() {
             return;
         }
@@ -47,6 +48,9 @@ pub extern "C-unwind" fn amrescan(
         let varlena = pg_sys::pg_detoast_datum(query_datum.cast_mut_ptr());
         let ptr = varlena as *const u8;
         let dim = *(ptr.add(4) as *const u16);
+        pgrx::warning!("scan: query dim={}, varlena bytes: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
+            dim, *ptr.add(0), *ptr.add(1), *ptr.add(2), *ptr.add(3),
+            *ptr.add(4), *ptr.add(5), *ptr.add(6), *ptr.add(7));
         let query_vec = std::slice::from_raw_parts(ptr.add(8) as *const f32, dim as usize);
 
         // Load index from cache or pages
@@ -64,7 +68,9 @@ pub extern "C-unwind" fn amrescan(
             radius: None,
         };
 
+        pgrx::warning!("scan: about to search, query_len={}", query_vec.len());
         let result = hnsw.search(query_vec, &req).expect("hanns search failed");
+        pgrx::warning!("scan: search ok, {} results", result.ids.len());
 
         // Convert to scan state
         let mut state = Box::new(HnswScanState {

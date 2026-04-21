@@ -44,9 +44,38 @@ pub fn get_or_load(index_rel: &PgRelation) -> Result<Arc<HnswIndex>, String> {
     let data = unsafe { read_index_data_from_pages(index_rel, &meta) };
     let read_elapsed = t_read.elapsed();
 
+    // Deserialize in a dedicated thread with 32MB stack to avoid PG backend
+    // stack limitations. PG backends use ~2MB stacks; hanns deserialize has
+    // deep recursion and SIMD that can segfault in constrained stacks.
     let t_deser = std::time::Instant::now();
-    let index = HnswIndex::fast_deserialize_from_bytes(&data)
-        .map_err(|e| format!("fast_deserialize: {e}"))?;
+    pgrx::warning!("index_cache: starting deserialize in thread, data_len={}", data.len());
+
+    let data_clone = data.clone();
+    let builder = std::thread::Builder::new()
+        .name("hanns-deser".into())
+        .stack_size(32 * 1024 * 1024); // 32MB stack
+    let handle = builder.spawn(move || {
+        HnswIndex::fast_deserialize_from_bytes(&data_clone)
+    }).map_err(|e| format!("thread spawn: {e}"))?;
+
+    let index = match handle.join() {
+        Ok(Ok(idx)) => idx,
+        Ok(Err(e)) => return Err(format!("deserialize: {e}")),
+        Err(_) => return Err("deserialize panicked (thread join failed)".into()),
+    };
+    pgrx::warning!(
+        "index_cache: deserialize done in {:?}, data_len={}",
+        t_deser.elapsed(), data.len()
+    );
+
+    // Verify: try a dummy search to confirm index is valid
+    let dim = meta.num_dimensions as usize;
+    let dummy_query = vec![0.0f32; dim];
+    let dummy_req = hanns::SearchRequest { top_k: 1, nprobe: 10, ..Default::default() };
+    match index.search(&dummy_query, &dummy_req) {
+        Ok(r) => pgrx::warning!("index_cache: verify search ok, {} results", r.ids.len()),
+        Err(e) => pgrx::warning!("index_cache: verify search FAILED: {}", e),
+    }
     let deser_elapsed = t_deser.elapsed();
 
     pgrx::warning!(
@@ -77,7 +106,6 @@ unsafe fn read_index_data_from_pages(
 
         let max_offset = pg_sys::PageGetMaxOffsetNumber(page);
         if max_offset == 0 {
-                pgrx::warning!("index_cache: block {} has no items", block_no);
             pg_sys::UnlockReleaseBuffer(buffer);
             continue;
         }
@@ -91,7 +119,9 @@ unsafe fn read_index_data_from_pages(
         pg_sys::UnlockReleaseBuffer(buffer);
     }
 
-    pgrx::warning!("index_cache: loaded {} blocks, {} bytes total", num_blocks, result.len());
+    pgrx::warning!(
+        "index_cache: loaded {} blocks, {} bytes total",
+        num_blocks, result.len());
     result
 }
 
